@@ -27,7 +27,7 @@ from tenacity import (
     before_sleep_log,
 )
 
-from .base import BaseFetcher, DataFetchError, STANDARD_COLUMNS
+from .base import BaseFetcher, DataFetchError, STANDARD_COLUMNS, RealtimeQuote
 
 logger = logging.getLogger(__name__)
 
@@ -64,17 +64,22 @@ class YfinanceFetcher(BaseFetcher):
         Yahoo Finance A 股代码格式：
         - 沪市：600519.SS (Shanghai Stock Exchange)
         - 深市：000001.SZ (Shenzhen Stock Exchange)
+        - 美股：AAPL (直接使用)
         
         Args:
-            stock_code: 原始代码，如 '600519', '000001'
+            stock_code: 原始代码，如 '600519', '000001', 'AAPL'
             
         Returns:
-            Yahoo Finance 格式代码，如 '600519.SS', '000001.SZ'
+            Yahoo Finance 格式代码，如 '600519.SS', '000001.SZ', 'AAPL'
         """
         code = stock_code.strip()
         
         # 已经包含后缀的情况
         if '.SS' in code.upper() or '.SZ' in code.upper():
+            return code.upper()
+            
+        # 美股判断：纯字母代码（如 AAPL, TSLA）或包含点号但非后缀（如 BRK.B）
+        if code.replace('.', '').isalpha():
             return code.upper()
         
         # 去除可能的后缀
@@ -83,10 +88,11 @@ class YfinanceFetcher(BaseFetcher):
         # 根据代码前缀判断市场
         if code.startswith(('600', '601', '603', '688')):
             return f"{code}.SS"
-        elif code.startswith(('000', '002', '300')):
+        elif code.startswith(('000', '002', '300', '430', '830', '870')): # 增加了北交所前缀以防万一
             return f"{code}.SZ"
         else:
-            logger.warning(f"无法确定股票 {code} 的市场，默认使用深市")
+            # 数字开头但无法识别的，默认当作深市处理（原有逻辑），或者可以考虑抛错
+            logger.warning(f"无法确定股票 {code} 的市场，默认使用深市格式")
             return f"{code}.SZ"
     
     @retry(
@@ -115,23 +121,54 @@ class YfinanceFetcher(BaseFetcher):
         
         try:
             # 使用 yfinance 下载数据
-            df = yf.download(
-                tickers=yf_code,
-                start=start_date,
-                end=end_date,
-                progress=False,  # 禁止进度条
-                auto_adjust=True,  # 自动调整价格（复权）
-            )
+            # multi_level_index=False 确保返回单层列索引（部分新版支持）
+            try:
+                df = yf.download(
+                    tickers=yf_code,
+                    start=start_date,
+                    end=end_date,
+                    progress=False,
+                    auto_adjust=True
+                )
+            except Exception as download_error:
+                # 某些旧版不支持 auto_adjust
+                logger.warning(f"yf.download 常规调用失败: {download_error}，尝试备选参数")
+                df = yf.download(
+                    tickers=yf_code,
+                    start=start_date,
+                    end=end_date,
+                    progress=False
+                )
+
+            if df is None or df.empty:
+                raise DataFetchError(f"Yahoo Finance 未查询到 {stock_code} ({yf_code}) 的数据")
             
-            if df.empty:
-                raise DataFetchError(f"Yahoo Finance 未查询到 {stock_code} 的数据")
-            
+            # 处理可能的 MultiIndex 列 (如果 download 返回了 (Price, Ticker) 格式)
+            if isinstance(df.columns, pd.MultiIndex):
+                # 如果是多层索引，尝试只取第一层级或者特定 Ticker
+                # 通常单股下载只有一层，或者是 (Date, Close)
+                try:
+                    df = df.xs(yf_code, level=1, axis=1)
+                except:
+                    # 如果 xs 失败，可能是 structure 不同，直接 droplevel
+                    df.columns = df.columns.get_level_values(0)
+
+            # 确保索引是 DatetimeIndex
+            if not isinstance(df.index, pd.DatetimeIndex):
+                # 尝试将 Date 列设为索引如果它存在
+                if 'Date' in df.columns:
+                    df = df.set_index('Date')
+                else:
+                    # 如果这也不是，那数据结构可能有问题
+                    pass
+
             return df
             
         except Exception as e:
             if isinstance(e, DataFetchError):
                 raise
-            raise DataFetchError(f"Yahoo Finance 获取数据失败: {e}") from e
+            # 捕获所有异常并转换为 DataFetchError，包含原始错误信息
+            raise DataFetchError(f"Yahoo Finance 获取数据失败: {str(e)}") from e
     
     def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
         """
@@ -181,6 +218,60 @@ class YfinanceFetcher(BaseFetcher):
         df = df[existing_cols]
         
         return df
+
+    def get_realtime_quote(self, stock_code: str) -> Optional[RealtimeQuote]:
+        """
+        获取实时行情 (Yahoo Finance)
+        """
+        import yfinance as yf
+        yf_code = self._convert_stock_code(stock_code)
+        
+        try:
+            ticker = yf.Ticker(yf_code)
+            # fast_info usually provides faster access to current price
+            info = ticker.fast_info
+            # Some fields might be in ticker.info (more detailed but slower)
+            
+            price = info.last_price
+            prev_close = info.previous_close
+            
+            if price is None or prev_close is None:
+                 # Fallback to history if fast_info fails or market closed
+                 hist = ticker.history(period="1d")
+                 if not hist.empty:
+                     price = hist['Close'].iloc[-1]
+                     # If we only have 1d, we can't get prev_close easily unless we fetch more
+                     # But fast_info should work for most US stocks
+            
+            change_amount = 0.0
+            change_pct = 0.0
+            
+            if price and prev_close:
+                change_amount = price - prev_close
+                change_pct = (change_amount / prev_close) * 100
+            
+            # yfinance doesn't provide real-time turnover rate easily without float shares
+            # We can try to get market cap
+            mkt_cap = info.market_cap
+            
+            # Volume 
+            # Note: fast_info doesn't always have current volume.
+            # We might need detail info for that.
+            
+            # Construct Quote
+            return RealtimeQuote(
+                code=stock_code,
+                name=stock_code, # Yahoo usually doesn't give short Chinese name
+                price=round(price, 2) if price else 0.0,
+                change_pct=round(change_pct, 2),
+                change_amount=round(change_amount, 2),
+                total_mv=mkt_cap if mkt_cap else 0.0,
+                # Other fields blank for now
+            )
+            
+        except Exception as e:
+            logger.warning(f"Yahoo Finance realtime quote failed for {stock_code}: {e}")
+            return None
 
 
 if __name__ == "__main__":

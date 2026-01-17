@@ -18,8 +18,9 @@ import logging
 import random
 import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any
 
 import pandas as pd
 import numpy as np
@@ -38,6 +39,30 @@ logger = logging.getLogger(__name__)
 STANDARD_COLUMNS = ['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg']
 
 
+def is_us_stock(code: str) -> bool:
+    """
+    判断是否为美股代码
+    
+    规则：
+    1. 纯字母 (AAPL)
+    2. 包含点号但不含 A 股后缀 (BRK.B)
+    3. 非纯数字
+    """
+    # 移除 A 股后缀
+    upper_code = code.upper()
+    if upper_code.endswith(('.SH', '.SZ', '.BJ')):
+        return False
+        
+    clean_code = upper_code.replace('.SH', '').replace('.SZ', '').replace('.BJ', '')
+    
+    # A 股通常是 6 位数字
+    if clean_code.isdigit():
+        return False
+        
+    # 如果包含字母，大概率是美股（或港股，但本项目暂未区分港股）
+    return any(c.isalpha() for c in clean_code)
+
+
 class DataFetchError(Exception):
     """数据获取异常基类"""
     pass
@@ -51,6 +76,138 @@ class RateLimitError(DataFetchError):
 class DataSourceUnavailableError(DataFetchError):
     """数据源不可用异常"""
     pass
+
+
+@dataclass
+class RealtimeQuote:
+    """
+    实时行情数据
+    
+    包含当日实时交易数据和估值指标
+    """
+    code: str
+    name: str = ""
+    price: float = 0.0           # 最新价
+    change_pct: float = 0.0      # 涨跌幅(%)
+    change_amount: float = 0.0   # 涨跌额
+    
+    # 量价指标
+    volume_ratio: float = 0.0    # 量比（当前成交量/过去5日平均成交量）
+    turnover_rate: float = 0.0   # 换手率(%)
+    amplitude: float = 0.0       # 振幅(%)
+    
+    # 估值指标
+    pe_ratio: float = 0.0        # 市盈率(动态)
+    pb_ratio: float = 0.0        # 市净率
+    total_mv: float = 0.0        # 总市值(元)
+    circ_mv: float = 0.0         # 流通市值(元)
+    
+    # 其他
+    change_60d: float = 0.0      # 60日涨跌幅(%)
+    high_52w: float = 0.0        # 52周最高
+    low_52w: float = 0.0         # 52周最低
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """转换为字典"""
+        return {
+            'code': self.code,
+            'name': self.name,
+            'price': self.price,
+            'change_pct': self.change_pct,
+            'volume_ratio': self.volume_ratio,
+            'turnover_rate': self.turnover_rate,
+            'amplitude': self.amplitude,
+            'pe_ratio': self.pe_ratio,
+            'pb_ratio': self.pb_ratio,
+            'total_mv': self.total_mv,
+            'circ_mv': self.circ_mv,
+            'change_60d': self.change_60d,
+        }
+
+
+@dataclass  
+class ChipDistribution:
+    """
+    筹码分布数据
+    
+    反映持仓成本分布和获利情况
+    """
+    code: str
+    date: str = ""
+    
+    # 获利情况
+    profit_ratio: float = 0.0     # 获利比例(0-1)
+    avg_cost: float = 0.0         # 平均成本
+    
+    # 筹码集中度
+    cost_90_low: float = 0.0      # 90%筹码成本下限
+    cost_90_high: float = 0.0     # 90%筹码成本上限
+    concentration_90: float = 0.0  # 90%筹码集中度（越小越集中）
+    
+    cost_70_low: float = 0.0      # 70%筹码成本下限
+    cost_70_high: float = 0.0     # 70%筹码成本上限
+    concentration_70: float = 0.0  # 70%筹码集中度
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """转换为字典"""
+        return {
+            'code': self.code,
+            'date': self.date,
+            'profit_ratio': self.profit_ratio,
+            'avg_cost': self.avg_cost,
+            'cost_90_low': self.cost_90_low,
+            'cost_90_high': self.cost_90_high,
+            'concentration_90': self.concentration_90,
+            'concentration_70': self.concentration_70,
+        }
+    
+    def get_chip_status(self, current_price: float) -> str:
+        """
+        获取筹码状态描述
+        
+        Args:
+            current_price: 当前股价
+            
+        Returns:
+            筹码状态描述
+        """
+        status_parts = []
+        
+        # 获利比例分析
+        if self.profit_ratio >= 0.9:
+            status_parts.append("获利盘极高(>90%)")
+        elif self.profit_ratio >= 0.7:
+            status_parts.append("获利盘较高(70-90%)")
+        elif self.profit_ratio >= 0.5:
+            status_parts.append("获利盘中等(50-70%)")
+        elif self.profit_ratio >= 0.3:
+            status_parts.append("套牢盘较多(>30%)")
+        else:
+            status_parts.append("套牢盘极重(>70%)")
+        
+        # 筹码集中度分析 (90%集中度 < 10% 表示集中)
+        if self.concentration_90 < 0.08:
+            status_parts.append("筹码高度集中")
+        elif self.concentration_90 < 0.15:
+            status_parts.append("筹码较集中")
+        elif self.concentration_90 < 0.25:
+            status_parts.append("筹码分散度中等")
+        else:
+            status_parts.append("筹码较分散")
+        
+        # 成本与现价关系
+        if current_price > 0 and self.avg_cost > 0:
+            cost_diff = (current_price - self.avg_cost) / self.avg_cost * 100
+            if cost_diff > 20:
+                status_parts.append(f"现价高于平均成本{cost_diff:.1f}%")
+            elif cost_diff > 5:
+                status_parts.append(f"现价略高于成本{cost_diff:.1f}%")
+            elif cost_diff > -5:
+                status_parts.append("现价接近平均成本")
+            else:
+                status_parts.append(f"现价低于平均成本{abs(cost_diff):.1f}%")
+        
+        return "，".join(status_parts)
 
 
 class BaseFetcher(ABC):
@@ -167,6 +324,9 @@ class BaseFetcher(ABC):
         """
         df = df.copy()
         
+        # 0. 去除重复列名（防御性编程，防止出现同名列导致后续报错）
+        df = df.loc[:, ~df.columns.duplicated()]
+        
         # 确保日期列为 datetime 类型
         if 'date' in df.columns:
             df['date'] = pd.to_datetime(df['date'])
@@ -175,6 +335,11 @@ class BaseFetcher(ABC):
         numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg']
         for col in numeric_cols:
             if col in df.columns:
+                # 再次检查是否为 Series，如果是 DataFrame（仍有重复列）则强制取第一列
+                if isinstance(df[col], pd.DataFrame):
+                    logger.warning(f"检测到重复列 {col}，仅保留第一列")
+                    df[col] = df[col].iloc[:, 0]
+                
                 df[col] = pd.to_numeric(df[col], errors='coerce')
         
         # 去除关键列为空的行
@@ -319,7 +484,23 @@ class DataFetcherManager:
         """
         errors = []
         
-        for fetcher in self._fetchers:
+        # 针对美股的特殊处理策略
+        is_us = is_us_stock(stock_code)
+        
+        # 如果是美股，临时调整 fetchers 顺序，只保留支持美股的源（目前主要是 Yfinance）
+        # 或者将 Yfinance 提至最高优先级
+        current_fetchers = self._fetchers
+        if is_us:
+            # 筛选出支持美股的 fetcher (假设只有 YfinanceFetcher)
+            # 或者简单的将 YfinanceFetcher 放到第一个
+            us_fetchers = [f for f in self._fetchers if f.name == "YfinanceFetcher"]
+            other_fetchers = [f for f in self._fetchers if f.name != "YfinanceFetcher"]
+            # 美股只尝试 Yfinance，因为其他源不支持
+            current_fetchers = us_fetchers
+            if not current_fetchers:
+                 logger.warning(f"未找到支持美股的数据源 (YfinanceFetcher)")
+        
+        for fetcher in current_fetchers:
             try:
                 logger.info(f"尝试使用 [{fetcher.name}] 获取 {stock_code}...")
                 df = fetcher.get_daily_data(

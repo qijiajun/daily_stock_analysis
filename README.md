@@ -70,23 +70,11 @@
 | `EMAIL_SENDER` | 发件人邮箱（如 `xxx@qq.com`） | 可选 |
 | `EMAIL_PASSWORD` | 邮箱授权码（非登录密码） | 可选 |
 | `EMAIL_RECEIVERS` | 收件人邮箱（多个用逗号分隔，留空则发给自己） | 可选 |
-| `CUSTOM_WEBHOOK_URLS` | 自定义 Webhook（多个用逗号分隔） | 可选 |                                                                                                            | 可选 |
-| `FEISHU_APP_ID` | 飞书应用ID，需要去（[开发者后台](https://open.feishu.cn/app)创建应用，步骤参考[这里](https://blog.csdn.net/qq_38423105/article/details/149316776)） | 可选 |
-| `FEISHU_APP_SECRET` | 飞书应用APP_SECRET                                                                                                            | 可选 |
-| `FEISHU_FOLDER_TOKEN` | 飞书文档云盘文件夹Key(地址栏 folder 后面参数)  | 可选 |  
+| `CUSTOM_WEBHOOK_URLS` | 自定义 Webhook（多个用逗号分隔） | 可选 |
 
 > *注：至少配置一个渠道，配置多个则同时推送到所有渠道
 > 
 > 自定义 Webhook 支持：钉钉、Discord、Slack、Bark、自建服务等任意支持 POST JSON 的 Webhook
-> 
-
-> 通过飞书应用创建的飞书文档，里面的内容不会出现已截断的情况。应用创建好后需要执行以下操作：
-> 
-> 1.Github 配置对应 Secret
-> 
-> 2.创建群组，在群组设置->群机器人，将创建的应用添加到群组内，算上飞书 Webhook，此时群组应该会有两个机器人 
-> 
-> 3.点击飞书云盘文件夹的“...”,将群组添加为协作者，权限设置为可管理
 
 **其他配置**
 
@@ -292,24 +280,8 @@ daily_stock_analysis/
 详见 [贡献指南](CONTRIBUTING.md)
 
 ## 📄 License
+
 [MIT License](LICENSE) © 2026 ZhuLinsen
-
-如果你在项目中使用或基于本项目进行二次开发，
-非常欢迎在 README 或文档中注明来源并附上本仓库链接。
-这将有助于项目的持续维护和社区发展。
-
-## 📬 联系与合作
-- GitHub Issues：[提交 Issue](https://github.com/ZhuLinsen/daily_stock_analysis/issues)
-
-## ⭐ Star History
-
-<a href="https://star-history.com/#ZhuLinsen/daily_stock_analysis&Date">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=ZhuLinsen/daily_stock_analysis&type=Date&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=ZhuLinsen/daily_stock_analysis&type=Date" />
-   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=ZhuLinsen/daily_stock_analysis&type=Date" />
- </picture>
-</a>
 
 ## ⚠️ 免责声明
 

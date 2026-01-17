@@ -15,7 +15,6 @@ A股自选股智能分析系统 - 通知层
 """
 
 import logging
-import json
 import smtplib
 import re
 from datetime import datetime
@@ -201,7 +200,8 @@ class NotificationService:
     def generate_daily_report(
         self, 
         results: List[AnalysisResult],
-        report_date: Optional[str] = None
+        report_date: Optional[str] = None,
+        title: str = "自选股智能分析报告"
     ) -> str:
         """
         生成 Markdown 格式的日报（详细版）
@@ -209,6 +209,7 @@ class NotificationService:
         Args:
             results: 分析结果列表
             report_date: 报告日期（默认今天）
+            title: 报告标题
             
         Returns:
             Markdown 格式的日报内容
@@ -218,7 +219,7 @@ class NotificationService:
         
         # 标题
         report_lines = [
-            f"# 📅 {report_date} A股自选股智能分析报告",
+            f"# 📅 {report_date} {title}",
             "",
             f"> 共分析 **{len(results)}** 只股票 | 报告生成时间：{datetime.now().strftime('%H:%M:%S')}",
             "",
@@ -419,7 +420,8 @@ class NotificationService:
     def generate_dashboard_report(
         self, 
         results: List[AnalysisResult],
-        report_date: Optional[str] = None
+        report_date: Optional[str] = None,
+        title: str = "决策仪表盘"
     ) -> str:
         """
         生成决策仪表盘格式的日报（详细版）
@@ -429,6 +431,7 @@ class NotificationService:
         Args:
             results: 分析结果列表
             report_date: 报告日期（默认今天）
+            title: 报告标题
             
         Returns:
             Markdown 格式的决策仪表盘日报
@@ -445,7 +448,7 @@ class NotificationService:
         hold_count = sum(1 for r in results if r.operation_advice in ['持有', '观望'])
         
         report_lines = [
-            f"# 🎯 {report_date} 决策仪表盘",
+            f"# 🎯 {report_date} {title}",
             "",
             f"> 共分析 **{len(results)}** 只股票 | 🟢买入:{buy_count} 🟡观望:{hold_count} 🔴卖出:{sell_count}",
             "",
@@ -682,7 +685,11 @@ class NotificationService:
         
         return "\n".join(report_lines)
     
-    def generate_wechat_dashboard(self, results: List[AnalysisResult]) -> str:
+    def generate_wechat_dashboard(
+        self, 
+        results: List[AnalysisResult],
+        title: str = "决策仪表盘"
+    ) -> str:
         """
         生成企业微信决策仪表盘精简版（控制在4000字符内）
         
@@ -690,6 +697,7 @@ class NotificationService:
         
         Args:
             results: 分析结果列表
+            title: 报告标题
             
         Returns:
             精简版决策仪表盘
@@ -705,7 +713,7 @@ class NotificationService:
         hold_count = sum(1 for r in results if r.operation_advice in ['持有', '观望'])
         
         lines = [
-            f"## 🎯 {report_date} 决策仪表盘",
+            f"## 🎯 {report_date} {title}",
             "",
             f"> {len(results)}只股票 | 🟢买入:{buy_count} 🟡观望:{hold_count} 🔴卖出:{sell_count}",
             "",
@@ -1140,8 +1148,6 @@ class NotificationService:
             }
         }
         
-        说明：飞书文本消息不会渲染 Markdown，需使用交互卡片（lark_md）格式
-        
         注意：飞书文本消息限制约 20KB，超长内容会自动分批发送
         可通过环境变量 FEISHU_MAX_BYTES 调整限制值
         
@@ -1155,19 +1161,16 @@ class NotificationService:
             logger.warning("飞书 Webhook 未配置，跳过推送")
             return False
         
-        # 飞书 lark_md 支持有限，先做格式转换
-        formatted_content = self._format_feishu_markdown(content)
-
         max_bytes = self._feishu_max_bytes  # 从配置读取，默认 20000 字节
         
         # 检查字节长度，超长则分批发送
-        content_bytes = len(formatted_content.encode('utf-8'))
+        content_bytes = len(content.encode('utf-8'))
         if content_bytes > max_bytes:
             logger.info(f"飞书消息内容超长({content_bytes}字节/{len(content)}字符)，将分批发送")
-            return self._send_feishu_chunked(formatted_content, max_bytes)
+            return self._send_feishu_chunked(content, max_bytes)
         
         try:
-            return self._send_feishu_message(formatted_content)
+            return self._send_feishu_message(content)
         except Exception as e:
             logger.error(f"发送飞书消息失败: {e}")
             return False
@@ -1319,140 +1322,42 @@ class NotificationService:
         return success_count == total_chunks
     
     def _send_feishu_message(self, content: str) -> bool:
-        """发送单条飞书消息（优先使用 Markdown 卡片）"""
-        def _post_payload(payload: Dict[str, Any]) -> bool:
-            logger.debug(f"飞书请求 URL: {self._feishu_url}")
-            logger.debug(f"飞书请求 payload 长度: {len(content)} 字符")
-
-            response = requests.post(
-                self._feishu_url,
-                json=payload,
-                timeout=30
-            )
-
-            logger.debug(f"飞书响应状态码: {response.status_code}")
-            logger.debug(f"飞书响应内容: {response.text}")
-
-            if response.status_code == 200:
-                result = response.json()
-                code = result.get('code') if 'code' in result else result.get('StatusCode')
-                if code == 0:
-                    logger.info("飞书消息发送成功")
-                    return True
-                else:
-                    error_msg = result.get('msg') or result.get('StatusMessage', '未知错误')
-                    error_code = result.get('code') or result.get('StatusCode', 'N/A')
-                    logger.error(f"飞书返回错误 [code={error_code}]: {error_msg}")
-                    logger.error(f"完整响应: {result}")
-                    return False
-            else:
-                logger.error(f"飞书请求失败: HTTP {response.status_code}")
-                logger.error(f"响应内容: {response.text}")
-                return False
-
-        # 1) 优先使用交互卡片（支持 Markdown 渲染）
-        card_payload = {
-            "msg_type": "interactive",
-            "card": {
-                "config": {"wide_screen_mode": True},
-                "header": {
-                    "title": {
-                        "tag": "plain_text",
-                        "content": "A股智能分析报告"
-                    }
-                },
-                "elements": [
-                    {
-                        "tag": "div",
-                        "text": {
-                            "tag": "lark_md",
-                            "content": content
-                        }
-                    }
-                ]
-            }
-        }
-
-        if _post_payload(card_payload):
-            return True
-
-        # 2) 回退为普通文本消息
-        text_payload = {
+        """发送单条飞书消息"""
+        payload = {
             "msg_type": "text",
             "content": {
                 "text": content
             }
         }
-
-        return _post_payload(text_payload)
-
-    def _format_feishu_markdown(self, content: str) -> str:
-        """
-        将通用 Markdown 转换为飞书 lark_md 更友好的格式
-        - 飞书不支持 Markdown 标题（# / ## / ###），用加粗代替
-        - 引用块使用前缀替代
-        - 分隔线统一为细线
-        - 表格转换为条目列表
-        """
-        def _flush_table_rows(buffer: List[str], output: List[str]) -> None:
-            if not buffer:
-                return
-
-            def _parse_row(row: str) -> List[str]:
-                cells = [c.strip() for c in row.strip().strip('|').split('|')]
-                return [c for c in cells if c]
-
-            rows = []
-            for raw in buffer:
-                if re.match(r'^\s*\|?\s*[:-]+\s*(\|\s*[:-]+\s*)+\|?\s*$', raw):
-                    continue
-                parsed = _parse_row(raw)
-                if parsed:
-                    rows.append(parsed)
-
-            if not rows:
-                return
-
-            header = rows[0]
-            data_rows = rows[1:] if len(rows) > 1 else []
-            for row in data_rows:
-                pairs = []
-                for idx, cell in enumerate(row):
-                    key = header[idx] if idx < len(header) else f"列{idx + 1}"
-                    pairs.append(f"{key}：{cell}")
-                output.append(f"• {' | '.join(pairs)}")
-
-        lines = []
-        table_buffer: List[str] = []
-
-        for raw_line in content.splitlines():
-            line = raw_line.rstrip()
-
-            if line.strip().startswith('|'):
-                table_buffer.append(line)
-                continue
-
-            if table_buffer:
-                _flush_table_rows(table_buffer, lines)
-                table_buffer = []
-
-            if re.match(r'^#{1,6}\s+', line):
-                title = re.sub(r'^#{1,6}\s+', '', line).strip()
-                line = f"**{title}**" if title else ""
-            elif line.startswith('> '):
-                quote = line[2:].strip()
-                line = f"💬 {quote}" if quote else ""
-            elif line.strip() == '---':
-                line = '────────'
-            elif line.startswith('- '):
-                line = f"• {line[2:].strip()}"
-
-            lines.append(line)
-
-        if table_buffer:
-            _flush_table_rows(table_buffer, lines)
-
-        return "\n".join(lines).strip()
+        
+        logger.debug(f"飞书请求 URL: {self._feishu_url}")
+        logger.debug(f"飞书请求 payload 长度: {len(content)} 字符")
+        
+        response = requests.post(
+            self._feishu_url,
+            json=payload,
+            timeout=30
+        )
+        
+        logger.debug(f"飞书响应状态码: {response.status_code}")
+        logger.debug(f"飞书响应内容: {response.text}")
+        
+        if response.status_code == 200:
+            result = response.json()
+            code = result.get('code') if 'code' in result else result.get('StatusCode')
+            if code == 0:
+                logger.info("飞书消息发送成功")
+                return True
+            else:
+                error_msg = result.get('msg') or result.get('StatusMessage', '未知错误')
+                error_code = result.get('code') or result.get('StatusCode', 'N/A')
+                logger.error(f"飞书返回错误 [code={error_code}]: {error_msg}")
+                logger.error(f"完整响应: {result}")
+                return False
+        else:
+            logger.error(f"飞书请求失败: HTTP {response.status_code}")
+            logger.error(f"响应内容: {response.text}")
+            return False
     
     def send_to_email(self, content: str, subject: Optional[str] = None) -> bool:
         """
@@ -1782,13 +1687,10 @@ class NotificationService:
                     'User-Agent': 'StockAnalysis/1.0'
                 }
                 
-                body = json.dumps(payload, ensure_ascii=False).encode('utf-8')
-                headers_with_charset = dict(headers)
-                headers_with_charset['Content-Type'] = 'application/json; charset=utf-8'
                 response = requests.post(
                     url,
-                    data=body,
-                    headers=headers_with_charset,
+                    json=payload,
+                    headers=headers,
                     timeout=30
                 )
                 
@@ -2096,7 +1998,7 @@ if __name__ == "__main__":
     # 显示检测到的渠道
     print(f"=== 通知渠道检测 ===")
     print(f"当前渠道: {service.get_channel_names()}")
-    print(f"渠道列表: {service.get_available_channels()}")
+    # print(f"渠道类型: {service.get_channel()}")
     print(f"服务可用: {service.is_available()}")
     
     # 生成日报

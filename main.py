@@ -35,18 +35,19 @@ import logging
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, date, timezone, timedelta
+from datetime import datetime, date
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
-from feishu_doc import FeishuDocManager
 
 from config import get_config, Config
 from storage import get_db, DatabaseManager
 from data_provider import DataFetcherManager
+from data_provider.base import is_us_stock
 from data_provider.akshare_fetcher import AkshareFetcher, RealtimeQuote, ChipDistribution
+from data_provider.yfinance_fetcher import YfinanceFetcher
 from analyzer import GeminiAnalyzer, AnalysisResult, STOCK_NAME_MAP
-from notification import NotificationService, NotificationChannel, send_daily_report
+from notification import NotificationService, send_daily_report
 from search_service import SearchService, SearchResponse
 from stock_analyzer import StockTrendAnalyzer, TrendAnalysisResult
 from market_analyzer import MarketAnalyzer
@@ -149,7 +150,8 @@ class StockAnalysisPipeline:
         # 初始化各模块
         self.db = get_db()
         self.fetcher_manager = DataFetcherManager()
-        self.akshare_fetcher = AkshareFetcher()  # 用于获取增强数据（量比、筹码等）
+        self.akshare_fetcher = AkshareFetcher()  # 用于获取 A 股增强数据
+        self.yfinance_fetcher = YfinanceFetcher() # 用于获取美股实时数据
         self.trend_analyzer = StockTrendAnalyzer()  # 趋势分析器
         self.analyzer = GeminiAnalyzer()
         self.notifier = NotificationService()
@@ -232,13 +234,21 @@ class StockAnalysisPipeline:
             AnalysisResult 或 None（如果分析失败）
         """
         try:
+            # 判断是否为美股
+            is_us = is_us_stock(code)
+            
             # 获取股票名称（优先从实时行情获取真实名称）
             stock_name = STOCK_NAME_MAP.get(code, '')
             
             # Step 1: 获取实时行情（量比、换手率等）
             realtime_quote: Optional[RealtimeQuote] = None
             try:
-                realtime_quote = self.akshare_fetcher.get_realtime_quote(code)
+                # 根据市场类型选择不同的数据源获取实时行情
+                if is_us:
+                    realtime_quote = self.yfinance_fetcher.get_realtime_quote(code)
+                else:
+                    realtime_quote = self.akshare_fetcher.get_realtime_quote(code)
+                
                 if realtime_quote:
                     # 使用实时行情返回的真实股票名称
                     if realtime_quote.name:
@@ -250,17 +260,18 @@ class StockAnalysisPipeline:
             
             # 如果还是没有名称，使用代码作为名称
             if not stock_name:
-                stock_name = f'股票{code}'
+                stock_name = code if is_us else f'股票{code}'
             
-            # Step 2: 获取筹码分布
+            # Step 2: 获取筹码分布 (仅 A 股)
             chip_data: Optional[ChipDistribution] = None
-            try:
-                chip_data = self.akshare_fetcher.get_chip_distribution(code)
-                if chip_data:
-                    logger.info(f"[{code}] 筹码分布: 获利比例={chip_data.profit_ratio:.1%}, "
-                              f"90%集中度={chip_data.concentration_90:.2%}")
-            except Exception as e:
-                logger.warning(f"[{code}] 获取筹码分布失败: {e}")
+            if not is_us:
+                try:
+                    chip_data = self.akshare_fetcher.get_chip_distribution(code)
+                    if chip_data:
+                        logger.info(f"[{code}] 筹码分布: 获利比例={chip_data.profit_ratio:.1%}, "
+                                  f"90%集中度={chip_data.concentration_90:.2%}")
+                except Exception as e:
+                    logger.warning(f"[{code}] 获取筹码分布失败: {e}")
             
             # Step 3: 趋势分析（基于交易理念）
             trend_result: Optional[TrendAnalysisResult] = None
@@ -500,7 +511,6 @@ class StockAnalysisPipeline:
         
         # 使用配置中的股票列表
         if stock_codes is None:
-            self.config.refresh_stock_list()
             stock_codes = self.config.stock_list
         
         if not stock_codes:
@@ -559,61 +569,84 @@ class StockAnalysisPipeline:
     
     def _send_notifications(self, results: List[AnalysisResult]) -> None:
         """
-        发送分析结果通知
-        
-        生成决策仪表盘格式的报告
+        发送分析结果通知（区分A股和美股分别发送）
         
         Args:
             results: 分析结果列表
         """
         try:
-            logger.info("生成决策仪表盘日报...")
+            # 分类股票
+            cn_results = []
+            us_results = []
             
-            # 生成决策仪表盘格式的详细日报
-            report = self.notifier.generate_dashboard_report(results)
+            for res in results:
+                if is_us_stock(res.code):
+                    us_results.append(res)
+                else:
+                    cn_results.append(res)
+            
+            # 分别处理两个市场
+            if cn_results:
+                self._send_market_report(cn_results, "A股")
+            
+            if us_results:
+                # 如果两个都有，稍微停顿一下，防止消息粘连
+                if cn_results:
+                    time.sleep(2)
+                self._send_market_report(us_results, "美股")
+                
+            if not cn_results and not us_results:
+                logger.warning("没有有效的分析结果")
+                
+        except Exception as e:
+            logger.error(f"发送通知失败: {e}")
+
+    def _send_market_report(self, results: List[AnalysisResult], market_name: str) -> None:
+        """
+        发送单个市场的分析报告
+        
+        Args:
+            results: 该市场的分析结果列表
+            market_name: 市场名称（A股/美股）
+        """
+        try:
+            logger.info(f"生成{market_name}决策仪表盘...")
+            
+            date_str = datetime.now().strftime('%Y%m%d')
+            title = f"{market_name}决策仪表盘"
+            filename_suffix = "us" if market_name == "美股" else "cn"
+            
+            # 生成详细版日报（用于保存）
+            full_report = self.notifier.generate_dashboard_report(
+                results, 
+                title=title
+            )
             
             # 保存到本地
-            filepath = self.notifier.save_report_to_file(report)
-            logger.info(f"决策仪表盘日报已保存: {filepath}")
+            filename = f"report_{filename_suffix}_{date_str}.md"
+            filepath = self.notifier.save_report_to_file(full_report, filename=filename)
+            logger.info(f"{market_name}日报已保存: {filepath}")
             
             # 推送通知
             if self.notifier.is_available():
-                channels = self.notifier.get_available_channels()
-
-                # 企业微信：只发精简版（平台限制）
-                wechat_success = False
-                if NotificationChannel.WECHAT in channels:
-                    dashboard_content = self.notifier.generate_wechat_dashboard(results)
-                    logger.info(f"企业微信仪表盘长度: {len(dashboard_content)} 字符")
-                    logger.debug(f"企业微信推送内容:\n{dashboard_content}")
-                    wechat_success = self.notifier.send_to_wechat(dashboard_content)
-
-                # 其他渠道：发完整报告（避免自定义 Webhook 被 wechat 截断逻辑污染）
-                non_wechat_success = False
-                for channel in channels:
-                    if channel == NotificationChannel.WECHAT:
-                        continue
-                    if channel == NotificationChannel.FEISHU:
-                        non_wechat_success = self.notifier.send_to_feishu(report) or non_wechat_success
-                    elif channel == NotificationChannel.TELEGRAM:
-                        non_wechat_success = self.notifier.send_to_telegram(report) or non_wechat_success
-                    elif channel == NotificationChannel.EMAIL:
-                        non_wechat_success = self.notifier.send_to_email(report) or non_wechat_success
-                    elif channel == NotificationChannel.CUSTOM:
-                        non_wechat_success = self.notifier.send_to_custom(report) or non_wechat_success
-                    else:
-                        logger.warning(f"未知通知渠道: {channel}")
-
-                success = wechat_success or non_wechat_success
+                # 生成精简版日报（用于推送）
+                dashboard_content = self.notifier.generate_wechat_dashboard(
+                    results, 
+                    title=title
+                )
+                logger.info(f"{market_name}推送内容长度: {len(dashboard_content)} 字符")
+                logger.debug(f"推送内容:\n{dashboard_content}")
+                
+                success = self.notifier.send(dashboard_content)
                 if success:
-                    logger.info("决策仪表盘推送成功")
+                    logger.info(f"{market_name}仪表盘推送成功")
                 else:
-                    logger.warning("决策仪表盘推送失败")
+                    logger.warning(f"{market_name}仪表盘推送失败")
             else:
                 logger.info("通知渠道未配置，跳过推送")
                 
         except Exception as e:
-            logger.error(f"发送通知失败: {e}")
+            logger.error(f"发送{market_name}通知异常: {e}")
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -709,15 +742,6 @@ def run_market_review(notifier: NotificationService, analyzer=None, search_servi
         review_report = market_analyzer.run_daily_review()
         
         if review_report:
-            # 保存报告到文件
-            date_str = datetime.now().strftime('%Y%m%d')
-            report_filename = f"market_review_{date_str}.md"
-            filepath = notifier.save_report_to_file(
-                f"# 🎯 大盘复盘\n\n{review_report}", 
-                report_filename
-            )
-            logger.info(f"大盘复盘报告已保存: {filepath}")
-            
             # 推送通知
             if notifier.is_available():
                 # 添加标题
@@ -762,17 +786,12 @@ def run_full_analysis(
         )
         
         # 2. 运行大盘复盘（如果启用且不是仅个股模式）
-        market_report = ""
         if config.market_review_enabled and not args.no_market_review:
-            # 只调用一次，并获取结果
-            review_result = run_market_review(
+            run_market_review(
                 notifier=pipeline.notifier,
                 analyzer=pipeline.analyzer,
                 search_service=pipeline.search_service
             )
-            # 如果有结果，赋值给 market_report 用于后续飞书文档生成
-            if review_result:
-                market_report = review_result
         
         # 输出摘要
         if results:
@@ -785,39 +804,6 @@ def run_full_analysis(
                 )
         
         logger.info("\n任务执行完成")
-
-        # === 新增：生成飞书云文档 ===
-        try:
-            feishu_doc = FeishuDocManager()
-            if feishu_doc.is_configured() and (results or market_report):
-                logger.info("正在创建飞书云文档...")
-
-                # 1. 准备标题 "01-01 13:01大盘复盘"
-                tz_cn = timezone(timedelta(hours=8))
-                now = datetime.now(tz_cn)
-                doc_title = f"{now.strftime('%Y-%m-%d %H:%M')} 大盘复盘"
-
-                # 2. 准备内容 (拼接个股分析和大盘复盘)
-                full_content = ""
-
-                # 添加大盘复盘内容（如果有）
-                if market_report:
-                    full_content += f"# 📈 大盘复盘\n\n{market_report}\n\n---\n\n"
-
-                # 添加个股决策仪表盘（使用 NotificationService 生成）
-                if results:
-                    dashboard_content = pipeline.notifier.generate_dashboard_report(results)
-                    full_content += f"# 🚀 个股决策仪表盘\n\n{dashboard_content}"
-
-                # 3. 创建文档
-                doc_url = feishu_doc.create_daily_doc(doc_title, full_content)
-                if doc_url:
-                    logger.info(f"飞书云文档创建成功: {doc_url}")
-                    # 可选：将文档链接也推送到群里
-                    pipeline.notifier.send(f"[{now.strftime('%Y-%m-%d %H:%M')}] 复盘文档创建成功: {doc_url}")
-
-        except Exception as e:
-            logger.error(f"飞书文档生成失败: {e}")
         
     except Exception as e:
         logger.exception(f"分析流程执行失败: {e}")
